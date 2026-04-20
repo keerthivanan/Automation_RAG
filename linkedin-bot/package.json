@@ -1,0 +1,15 @@
+{
+  "name": "linkedin-auto-reply-bot",
+  "version": "1.0.0",
+  "description": "Auto-reply to LinkedIn comments using Claude AI",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "setup": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.67.0",
+    "playwright": "^1.48.0"
+  }
+}

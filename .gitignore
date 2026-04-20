@@ -1,5 +1,12 @@
 # Environment variables — NEVER commit real keys
 .env
+.env local
+.env.local
+linkedin-bot/.env
+linkedin-bot/cookies.json
+linkedin-bot/replied.json
+node_modules/
+linkedin-bot/node_modules/
 
 # Python
 __pycache__/
