@@ -71,26 +71,54 @@ async function createBrowser() {
 
 // ─── Login ────────────────────────────────────────────────────────────────────
 
+function loggedIn(url) {
+  return !url.includes('/login') && !url.includes('/checkpoint') && !url.includes('/authwall');
+}
+
 async function ensureLoggedIn(context, existingPage = null) {
   const page = existingPage || await context.newPage();
 
-  if (!existingPage && fs.existsSync(COOKIES_FILE)) {
-    try {
-      const cookies = JSON.parse(fs.readFileSync(COOKIES_FILE, 'utf-8'));
-      await context.addCookies(cookies);
-    } catch { /* corrupted file — skip */ }
+  if (!existingPage) {
+    // Try 1: saved cookies from previous runs (freshest session)
+    if (fs.existsSync(COOKIES_FILE)) {
+      try {
+        await context.addCookies(JSON.parse(fs.readFileSync(COOKIES_FILE, 'utf-8')));
+      } catch { /* bad file — skip */ }
 
-    await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000);
+      await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(3000);
 
-    const url = page.url();
-    if (!url.includes('/login') && !url.includes('/checkpoint') && !url.includes('/authwall')) {
-      console.log('✅ Session restored from cookies');
-      return page;
+      if (loggedIn(page.url())) {
+        console.log('✅ Session restored from saved cookies');
+        return page;
+      }
+      console.log('⚠️  Saved session expired');
     }
-    console.log('⚠️  Cookies expired — logging in fresh');
+
+    // Try 2: li_at cookie from env (no login form, no 2FA)
+    if (process.env.LINKEDIN_LI_AT) {
+      await context.addCookies([{
+        name: 'li_at',
+        value: process.env.LINKEDIN_LI_AT,
+        domain: '.linkedin.com',
+        path: '/',
+        httpOnly: true,
+        secure: true
+      }]);
+
+      await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(3000);
+
+      if (loggedIn(page.url())) {
+        console.log('✅ Logged in via li_at cookie');
+        saveCookies(await context.cookies());
+        return page;
+      }
+      console.log('⚠️  li_at expired — falling back to email/password');
+    }
   }
 
+  // Try 3: email/password fallback
   await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(1500);
   await page.fill('#username', process.env.LINKEDIN_EMAIL);
@@ -100,8 +128,6 @@ async function ensureLoggedIn(context, existingPage = null) {
   await page.click('button[type="submit"]');
 
   console.log('⏳ Waiting for login — complete any 2FA in the browser window...');
-
-  // nav.global-nav appears on any page after successful login (feed, mynetwork, etc.)
   await page.waitForSelector('nav.global-nav', { timeout: 120000 });
   await page.waitForTimeout(2000);
 
