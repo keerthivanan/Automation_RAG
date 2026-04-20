@@ -6,6 +6,7 @@ linkedin-bot/.env
 linkedin-bot/cookies.json
 linkedin-bot/replied.json
 linkedin-bot/commented_posts.json
+linkedin-bot/daily_stats.json
 linkedin-bot/browser-profile/
 node_modules/
 linkedin-bot/node_modules/

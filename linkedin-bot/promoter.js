@@ -4,35 +4,59 @@ const path = require('path');
 const OpenAI = require('openai');
 
 const BROWSER_PROFILE = path.join(__dirname, 'browser-profile');
-const COMMENTED_FILE = path.join(__dirname, 'commented_posts.json');
+const COMMENTED_FILE  = path.join(__dirname, 'commented_posts.json');
+const DAILY_FILE      = path.join(__dirname, 'daily_stats.json');
 
-// ─── Dizilo context ───────────────────────────────────────────────────────────
+const MAX_DAILY_COMMENTS  = 20;   // hard stop at 20 comments per day
+const PROMOTION_RATIO     = 0.30; // exactly 30% of comments mention Dizilo
+const DELAY_BETWEEN_MS    = 50000; // 50s between comments — looks human
+
+// ─── Dizilo ───────────────────────────────────────────────────────────────────
 
 const DIZILO = {
   name: 'Dizilo',
-  what: 'We build AI agents, workflow automation systems, and e-commerce stores for businesses',
-  results: "clients see 340% pipeline growth and 70% support cost reduction",
-  speed: 'idea to production in 2 weeks',
+  what: 'builds AI agents, workflow automation, and e-commerce stores for businesses',
+  results: 'clients see 340% pipeline growth and 70% support cost reduction',
   tagline: 'We build what makes every job easier'
 };
 
-// Hashtags where Dizilo's ideal customers hang out
 const HASHTAGS = [
-  'automation',
-  'ecommerce',
-  'artificialintelligence',
-  'entrepreneur',
-  'businessautomation',
-  'shopify',
-  'aiagents',
-  'workflow',
-  'startup',
-  'productivity'
+  'automation', 'ecommerce', 'artificialintelligence',
+  'entrepreneur', 'businessautomation', 'shopify',
+  'aiagents', 'workflow', 'startup', 'productivity'
 ];
 
-const MIN_LIKES = 30;          // only target posts with real engagement
-const MAX_COMMENTS_PER_RUN = 8; // max comments per session (stay under radar)
-const DELAY_BETWEEN_COMMENTS_MS = 50000; // ~50 seconds between comments
+const MIN_LIKES = 30;
+
+// ─── Daily stats ──────────────────────────────────────────────────────────────
+
+function today() {
+  return new Date().toISOString().split('T')[0]; // '2026-04-21'
+}
+
+function loadDaily() {
+  try {
+    const data = JSON.parse(fs.readFileSync(DAILY_FILE, 'utf-8'));
+    if (data.date !== today()) return { date: today(), total: 0, mentions: 0 };
+    return data;
+  } catch {
+    return { date: today(), total: 0, mentions: 0 };
+  }
+}
+
+function saveDaily(stats) {
+  fs.writeFileSync(DAILY_FILE, JSON.stringify(stats, null, 2));
+}
+
+// ─── 30/70 ratio logic ────────────────────────────────────────────────────────
+
+// Returns true if the NEXT comment should mention Dizilo,
+// based on keeping the overall ratio close to 30%.
+function shouldMention(stats) {
+  if (stats.total === 0) return false; // never start with a promo
+  const currentRatio = stats.mentions / stats.total;
+  return currentRatio < PROMOTION_RATIO;
+}
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
 
@@ -51,31 +75,34 @@ function saveCommented(set) {
 
 // ─── OpenAI ───────────────────────────────────────────────────────────────────
 
-async function generateComment(client, postText) {
+async function generateComment(client, postText, mentionDizilo) {
+  // Explicit instruction switches based on 30/70 decision
+  const mentionRule = mentionDizilo
+    ? `Mention ${DIZILO.name} in ONE short natural sentence — something like "we've seen this exact pattern at ${DIZILO.name}" or "this is why we built ${DIZILO.name} — ${DIZILO.tagline}". Keep it conversational, never salesy.`
+    : `Do NOT mention ${DIZILO.name} or any company at all. Write purely as an industry professional sharing a genuine insight or experience.`;
+
   const res = await client.chat.completions.create({
     model: 'gpt-4o-mini',
-    max_tokens: 220,
+    max_tokens: 200,
     messages: [{
       role: 'user',
-      content: `You are a LinkedIn professional who works at ${DIZILO.name}.
+      content: `You are a LinkedIn professional with deep expertise in automation, AI, and e-commerce.
 
-About ${DIZILO.name}: ${DIZILO.what}. ${DIZILO.results}. ${DIZILO.tagline}.
-
-Here is a LinkedIn post getting good engagement:
+Post gaining engagement:
 "${postText.slice(0, 600)}"
 
-Write a LinkedIn comment that:
-1. Genuinely adds value or insight to the discussion — make it actually useful
-2. If the topic naturally connects to what ${DIZILO.name} does (automation, AI, ecommerce, manual work, scaling), mention ${DIZILO.name} in ONE natural sentence — like "we've seen this firsthand at ${DIZILO.name}" or "this is exactly why we built ${DIZILO.name}"
-3. If it doesn't connect naturally, write a good comment WITHOUT mentioning ${DIZILO.name} — a helpful comment still builds brand
-4. Sound like a real person, not a company
-5. 2-3 sentences MAX
-6. No hashtags, no emojis, no "Great post!" or "This is so true!" openers
-7. Never sound like an ad or a pitch
+Write a comment that:
+1. Leads with a real insight, perspective, or experience — make it genuinely useful
+2. ${mentionRule}
+3. 2-3 sentences MAX
+4. No hashtags, no emojis
+5. Never start with "Great post!", "This is so true!", "Love this!" or similar
+6. Sound like a real person, not a brand account
 
-Output ONLY the comment text. Nothing else.`
+Output ONLY the comment text.`
     }]
   });
+
   return res.choices[0].message.content.trim();
 }
 
@@ -97,7 +124,6 @@ function loggedIn(url) {
 
 async function ensureLoggedIn(context) {
   const page = await context.newPage();
-
   await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(3000);
 
@@ -121,23 +147,20 @@ async function ensureLoggedIn(context) {
   return page;
 }
 
-// ─── Engagement parsing ───────────────────────────────────────────────────────
+// ─── Scan hashtag ─────────────────────────────────────────────────────────────
 
-function parseLikeCount(text) {
+function parseLikes(text) {
   if (!text) return 0;
-  const clean = text.replace(/,/g, '').trim().toLowerCase();
-  if (clean.includes('k')) return Math.floor(parseFloat(clean) * 1000);
-  return parseInt(clean) || 0;
+  const c = text.replace(/,/g, '').trim().toLowerCase();
+  if (c.includes('k')) return Math.floor(parseFloat(c) * 1000);
+  return parseInt(c) || 0;
 }
-
-// ─── Scan hashtag feed ────────────────────────────────────────────────────────
 
 async function scanHashtag(page, hashtag, commented) {
   const found = [];
 
   await page.goto(`https://www.linkedin.com/feed/hashtag/${hashtag}/`, {
-    waitUntil: 'domcontentloaded',
-    timeout: 30000
+    waitUntil: 'domcontentloaded', timeout: 30000
   });
   await page.waitForTimeout(4000);
 
@@ -157,7 +180,6 @@ async function scanHashtag(page, hashtag, commented) {
         '.feed-shared-update-v2__description, .feed-shared-text, .break-words',
         el => el.innerText.trim()
       ).catch(() => '');
-
       if (!text || text.length < 80) continue;
 
       const likesText = await post.$eval(
@@ -165,7 +187,7 @@ async function scanHashtag(page, hashtag, commented) {
         el => el.innerText.trim()
       ).catch(() => '0');
 
-      const likes = parseLikeCount(likesText);
+      const likes = parseLikes(likesText);
       if (likes < MIN_LIKES) continue;
 
       found.push({ post, postId, text, likes, hashtag });
@@ -178,7 +200,6 @@ async function scanHashtag(page, hashtag, commented) {
 // ─── Post comment ─────────────────────────────────────────────────────────────
 
 async function postComment(page, post, commentText) {
-  // Click the Comment action button to open the comment box
   const commentBtn = await post.$(
     'button[aria-label="Comment"], button[aria-label*="comment"]'
   );
@@ -217,16 +238,25 @@ async function postComment(page, post, commentText) {
 // ─── Run ──────────────────────────────────────────────────────────────────────
 
 async function run() {
+  const stats     = loadDaily();
   const commented = loadCommented();
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const client    = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  const context = await createContext();
-  const page = await ensureLoggedIn(context);
+  const remaining = MAX_DAILY_COMMENTS - stats.total;
+  if (remaining <= 0) {
+    console.log(`\n🛑 Already hit ${MAX_DAILY_COMMENTS} comments today. Come back tomorrow.\n`);
+    return;
+  }
 
   console.log(`\n🚀 Dizilo LinkedIn Promoter`);
-  console.log(`📌 Scanning ${HASHTAGS.length} hashtags for viral posts...\n`);
+  console.log(`📊 Today: ${stats.total}/${MAX_DAILY_COMMENTS} comments | ${stats.mentions} Dizilo mentions (${Math.round((stats.mentions / (stats.total || 1)) * 100)}%)`);
+  console.log(`📌 Slots remaining today: ${remaining}`);
+  console.log(`📌 Scanning hashtags...\n`);
 
-  // Collect posts across all hashtags
+  const context = await createContext();
+  const page    = await ensureLoggedIn(context);
+
+  // Collect posts
   let allPosts = [];
   for (const hashtag of HASHTAGS) {
     process.stdout.write(`  #${hashtag}... `);
@@ -235,7 +265,7 @@ async function run() {
     allPosts = allPosts.concat(posts);
   }
 
-  // Deduplicate by postId
+  // Deduplicate
   const seen = new Set();
   allPosts = allPosts.filter(p => {
     if (seen.has(p.postId)) return false;
@@ -243,20 +273,23 @@ async function run() {
     return true;
   });
 
-  // Sort: most viral first
+  // Sort by engagement
   allPosts.sort((a, b) => b.likes - a.likes);
 
-  const targets = allPosts.slice(0, MAX_COMMENTS_PER_RUN);
-  console.log(`\n📊 ${allPosts.length} unique posts found — commenting on top ${targets.length}\n`);
+  const targets = allPosts.slice(0, remaining);
+  console.log(`\n📊 ${allPosts.length} unique posts — commenting on ${targets.length}\n`);
 
   let done = 0;
 
   for (const { post, postId, text, likes, hashtag } of targets) {
     try {
-      console.log(`\n[${done + 1}/${targets.length}] #${hashtag} — ${likes} likes`);
-      console.log(`  📄 "${text.slice(0, 120)}..."`);
+      const mention = shouldMention(stats);
+      const label   = mention ? '🎯 DIZILO MENTION' : '💡 VALUE ONLY';
 
-      const comment = await generateComment(client, text);
+      console.log(`\n[${done + 1}/${targets.length}] #${hashtag} — ${likes} likes — ${label}`);
+      console.log(`  📄 "${text.slice(0, 110)}..."`);
+
+      const comment = await generateComment(client, text, mention);
       console.log(`  💬 "${comment}"`);
 
       await page.waitForTimeout(Math.floor(4000 + Math.random() * 4000));
@@ -267,21 +300,31 @@ async function run() {
         console.log('  ✅ Posted!');
         commented.add(postId);
         saveCommented(commented);
+
+        stats.total++;
+        if (mention) stats.mentions++;
+        saveDaily(stats);
+
         done++;
 
+        const ratio = Math.round((stats.mentions / stats.total) * 100);
+        console.log(`  📊 Today: ${stats.total}/${MAX_DAILY_COMMENTS} | Dizilo mentions: ${stats.mentions} (${ratio}%)`);
+
         if (done < targets.length) {
-          console.log(`  ⏳ Waiting ${DELAY_BETWEEN_COMMENTS_MS / 1000}s...`);
-          await page.waitForTimeout(DELAY_BETWEEN_COMMENTS_MS);
+          console.log(`  ⏳ Waiting ${DELAY_BETWEEN_MS / 1000}s...\n`);
+          await page.waitForTimeout(DELAY_BETWEEN_MS);
         }
       } else {
-        console.log('  ⚠️  Could not post — comment button not found');
+        console.log('  ⚠️  Could not post');
       }
     } catch (err) {
       console.error(`  ❌ ${err.message}`);
     }
   }
 
-  console.log(`\n✅ Done! Commented on ${done} posts.`);
+  console.log(`\n✅ Done! ${done} comments posted today total: ${stats.total}/${MAX_DAILY_COMMENTS}`);
+  console.log(`📊 Dizilo mentions: ${stats.mentions} / ${stats.total} = ${Math.round((stats.mentions / (stats.total || 1)) * 100)}%\n`);
+
   await context.close();
 }
 
