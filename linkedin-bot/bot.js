@@ -3,7 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const OpenAI = require('openai');
 
-const COOKIES_FILE = path.join(__dirname, 'cookies.json');
+// Persistent browser profile — stores cookies + localStorage + IndexedDB
+// This is why the session survives restarts without logging out
+const BROWSER_PROFILE = path.join(__dirname, 'browser-profile');
 const REPLIED_FILE = path.join(__dirname, 'replied.json');
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
@@ -19,10 +21,6 @@ function loadReplied() {
 
 function saveReplied(set) {
   fs.writeFileSync(REPLIED_FILE, JSON.stringify([...set], null, 2));
-}
-
-function saveCookies(cookies) {
-  fs.writeFileSync(COOKIES_FILE, JSON.stringify(cookies, null, 2));
 }
 
 function mySlug() {
@@ -53,20 +51,14 @@ Write a genuine 1–2 sentence LinkedIn reply. Acknowledge their comment, add va
 
 // ─── Browser ──────────────────────────────────────────────────────────────────
 
-async function createBrowser() {
-  const browser = await chromium.launch({
+async function createContext() {
+  return chromium.launchPersistentContext(BROWSER_PROFILE, {
     headless: false,
-    args: ['--disable-blink-features=AutomationControlled']
-  });
-  const context = await browser.newContext({
+    args: ['--disable-blink-features=AutomationControlled'],
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     viewport: { width: 1366, height: 768 },
     locale: 'en-US'
   });
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-  });
-  return { browser, context };
 }
 
 // ─── Login ────────────────────────────────────────────────────────────────────
@@ -78,47 +70,15 @@ function loggedIn(url) {
 async function ensureLoggedIn(context, existingPage = null) {
   const page = existingPage || await context.newPage();
 
-  if (!existingPage) {
-    // Try 1: saved cookies from previous runs (freshest session)
-    if (fs.existsSync(COOKIES_FILE)) {
-      try {
-        await context.addCookies(JSON.parse(fs.readFileSync(COOKIES_FILE, 'utf-8')));
-      } catch { /* bad file — skip */ }
+  await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(3000);
 
-      await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(3000);
-
-      if (loggedIn(page.url())) {
-        console.log('✅ Session restored from saved cookies');
-        return page;
-      }
-      console.log('⚠️  Saved session expired');
-    }
-
-    // Try 2: li_at cookie from env (no login form, no 2FA)
-    if (process.env.LINKEDIN_LI_AT) {
-      await context.addCookies([{
-        name: 'li_at',
-        value: process.env.LINKEDIN_LI_AT,
-        domain: '.linkedin.com',
-        path: '/',
-        httpOnly: true,
-        secure: true
-      }]);
-
-      await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(3000);
-
-      if (loggedIn(page.url())) {
-        console.log('✅ Logged in via li_at cookie');
-        saveCookies(await context.cookies());
-        return page;
-      }
-      console.log('⚠️  li_at expired — falling back to email/password');
-    }
+  if (loggedIn(page.url())) {
+    console.log('✅ Already logged in');
+    return page;
   }
 
-  // Try 3: email/password fallback
+  // Login fresh — persistent context saves it automatically after this
   await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(1500);
   await page.fill('#username', process.env.LINKEDIN_EMAIL);
@@ -131,8 +91,7 @@ async function ensureLoggedIn(context, existingPage = null) {
   await page.waitForSelector('nav.global-nav', { timeout: 120000 });
   await page.waitForTimeout(2000);
 
-  console.log('✅ Logged in successfully');
-  saveCookies(await context.cookies());
+  console.log('✅ Logged in — session saved to browser profile');
   return page;
 }
 
@@ -155,7 +114,7 @@ async function getCommentId(comment) {
   return (authorPath || text) ? `${authorPath}::${text}` : null;
 }
 
-// LinkedIn hides Edit/Delete in a dropdown so they're never in the live DOM.
+// LinkedIn hides Edit/Delete in a dropdown — never in live DOM.
 // Profile link comparison is the only reliable way to detect own comments.
 async function isOwnComment(comment) {
   const slug = mySlug();
@@ -198,7 +157,6 @@ async function postReply(page, comment, replyText) {
   await replyBox.type(replyText, { delay: Math.floor(55 + Math.random() * 35) });
   await page.waitForTimeout(1000);
 
-  // Try submit button selectors in order — aria-label first (stable), CSS class as fallback
   for (const sel of [
     'button[aria-label="Post reply"]',
     'button[aria-label="Post comment"]',
@@ -214,7 +172,7 @@ async function postReply(page, comment, replyText) {
     }
   }
 
-  // Keyboard fallback — Ctrl+Enter submits in LinkedIn's Quill editor
+  // Keyboard fallback
   await replyBox.press('Control+Return');
   await page.waitForTimeout(2500);
   return true;
@@ -222,7 +180,7 @@ async function postReply(page, comment, replyText) {
 
 // ─── Main scan ────────────────────────────────────────────────────────────────
 
-async function checkAndReply(page, context, client, replied) {
+async function checkAndReply(page, client, replied) {
   const profileUrl = process.env.LINKEDIN_PROFILE_URL.replace(/\/$/, '');
   const slug = mySlug();
 
@@ -244,17 +202,16 @@ async function checkAndReply(page, context, client, replied) {
 
   for (const post of posts) {
     try {
-      // Skip posts NOT authored by me (recent-activity shows other people's posts too)
+      // Skip posts not authored by me
       if (slug) {
         const authorHref = await post.$eval(
-          '.update-components-actor__meta a[href*="/in/"], ' +
-          '.feed-shared-actor__meta a[href*="/in/"]',
+          '.update-components-actor__meta a[href*="/in/"], .feed-shared-actor__meta a[href*="/in/"]',
           el => el.href.toLowerCase()
         ).catch(() => '');
         if (authorHref && !authorHref.includes(`/in/${slug}`)) continue;
       }
 
-      // Expand comments — scoped to social counts area to avoid clicking "Write a comment"
+      // Expand comments — scoped to social counts to avoid clicking write-comment button
       const commentBtn = await post.$(
         '.social-details-social-counts button[aria-label*="comment"], ' +
         '.social-details-social-counts button[aria-label*="Comment"]'
@@ -301,7 +258,6 @@ async function checkAndReply(page, context, client, replied) {
             console.log('  ✅ Reply posted');
             replied.add(commentId);
             saveReplied(replied);
-            saveCookies(await context.cookies());
             count++;
             await page.waitForTimeout(Math.floor(8000 + Math.random() * 6000));
           } else {
@@ -326,7 +282,7 @@ async function run() {
   const replied = loadReplied();
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  const { browser, context } = await createBrowser();
+  const context = await createContext();
   let page = await ensureLoggedIn(context);
 
   console.log(`\n🤖 Bot running — checking every ${interval / 1000}s`);
@@ -337,14 +293,13 @@ async function run() {
     console.log(`[${ts}] 🔍 Checking comments...`);
 
     try {
-      const url = page.url();
-      if (url.includes('/login') || url.includes('/checkpoint') || url.includes('/authwall')) {
+      if (!loggedIn(page.url())) {
         console.log('  ⚠️  Session expired — re-logging in');
         page = await ensureLoggedIn(context, page);
         return;
       }
 
-      const n = await checkAndReply(page, context, client, replied);
+      const n = await checkAndReply(page, client, replied);
       if (n === 0) console.log('  📭 No new comments');
       else console.log(`  ✅ Replied to ${n} comment(s)\n`);
     } catch (err) {
