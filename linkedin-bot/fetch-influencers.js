@@ -111,12 +111,20 @@ const SEARCH_QUERIES = [
       await page.waitForTimeout(2000).catch(() => {});
 
       const { followers, name } = await page.evaluate(() => {
-        const body = document.body.innerText;
-
-        // Read "X,XXX followers" or "X followers" directly from page text
-        const m = body.match(/([\d,]+)\s*followers/i);
+        // Most reliable: find the followers link on the profile (links to /followers/ page)
         let followers = 0;
-        if (m) followers = parseInt(m[1].replace(/,/g, '')) || 0;
+        const links = [...document.querySelectorAll('a[href*="followers"]')];
+        for (const a of links) {
+          const m = (a.textContent || '').replace(/,/g, '').match(/[\d]+/);
+          if (m) { followers = parseInt(m[0]); break; }
+        }
+
+        // Fallback: search only the first 3000 chars of body text (profile header area)
+        if (!followers) {
+          const top = document.body.innerText.slice(0, 3000);
+          const m = top.match(/([\d,]+)\s*followers/i);
+          if (m) followers = parseInt(m[1].replace(/,/g, '')) || 0;
+        }
 
         const name = document.querySelector('h1')?.textContent?.trim() || '';
         return { followers, name };

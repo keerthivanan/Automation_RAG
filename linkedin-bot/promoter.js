@@ -24,8 +24,6 @@ function shouldMention(stats) {
   return (stats.mentions / stats.total) < PROMOTION_RATIO;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
 function getHoursOld(datetime) {
   if (!datetime) return Infinity;
   const t = new Date(datetime);
@@ -93,6 +91,10 @@ async function ensureLoggedIn(context) {
 
   await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(1500);
+
+  const alive = await page.evaluate(() => true).catch(() => false);
+  if (!alive) throw new Error('Browser closed before login');
+
   await page.fill('#username', process.env.LINKEDIN_EMAIL);
   await page.waitForTimeout(400 + Math.floor(Math.random() * 400));
   await page.fill('#password', process.env.LINKEDIN_PASSWORD);
